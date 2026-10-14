@@ -30,6 +30,9 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any
+from contextlib import nullcontext
+
+from openkraken.backend.plus_io import PlusReplyError, checked_replies, upload_static
 
 try:  # pyusb is a liquidctl dependency; guarded so importing this module can't fail
     from usb.core import USBError as _USBError
@@ -307,6 +310,7 @@ class KrakenDevice:
         self._dev: Any | None = None
         self._connected: bool = False
         self._description: str = ""
+        self._lcd_retry_after = 0.0
         self.firmware_version: str = ""
         self.lcd_brightness: int = 50
         self.lcd_orientation: int = 0
@@ -489,6 +493,7 @@ class KrakenDevice:
             self._lcd_stream_needs_reinit = True
             # Fresh handles: give the bulk interface another chance.
             self._lcd_bulk_unavailable = False
+            self._lcd_retry_after = 0.0
             self._apply_init_status(init_status)
             logger.info(
                 "Connected to %s (fw=%s, brightness=%d%%, orientation=%d°)",
@@ -539,6 +544,14 @@ class KrakenDevice:
             return self._lcd_bulk_unavailable
 
     # -------------------------------------------------------------- telemetry
+    @property
+    def is_kraken_plus(self) -> bool:
+        return getattr(self._dev, "product_id", None) == 0x3014
+
+    @property
+    def lcd_resolution(self) -> tuple[int, int]:
+        return tuple(getattr(self._dev, "lcd_resolution", self.LCD_RESOLUTION))
+
     def get_status(self) -> DeviceStatus:
         """Read a telemetry snapshot.
 
@@ -549,7 +562,11 @@ class KrakenDevice:
             if self._dev is None or not self._connected:
                 return DeviceStatus.disconnected()
             try:
-                raw = self._dev.get_status()
+                with checked_replies(self._dev, status=True) if self.is_kraken_plus else nullcontext():
+                    raw = self._dev.get_status()
+            except PlusReplyError as exc:
+                logger.warning("Status unavailable: %s", exc)
+                raw = []  # Never turn an acknowledgement into plausible sensor values.
             except Exception:
                 logger.exception("get_status() failed; marking device disconnected")
                 self._mark_disconnected()
@@ -720,6 +737,15 @@ class KrakenDevice:
         # interface, so skip cheaply instead of hammering a claim that cannot
         # succeed every 2 s (the engine also stops rendering; see
         # :attr:`lcd_bulk_unavailable`).
+        if self.is_kraken_plus:
+            with self._lock:
+                if time.monotonic() < self._lcd_retry_after or self.lcd_bulk_unavailable:
+                    return False
+                ok = self._set_screen("static", str(image_path))
+                if not ok:
+                    self._lcd_retry_after = time.monotonic() + 30.0
+                    logger.warning("Plus sensor upload failed; pausing uploads for 30 seconds")
+                return ok
         if self.lcd_bulk_unavailable:
             logger.debug("set_lcd_sensor_frame: LCD bulk unavailable; skipping")
             return False
@@ -902,6 +928,9 @@ class KrakenDevice:
         mode afterwards.
         """
         with self._lock:
+            if self.is_kraken_plus:
+                logger.warning("Plus has no LCD media buckets; use liquid display mode instead")
+                return False
             if self._dev is None or not self._connected:
                 logger.warning("clear_lcd_media: device not connected")
                 return False
@@ -1170,6 +1199,8 @@ class KrakenDevice:
                 #     and retry (the guard suppresses the liquid switch, so even
                 #     this is flash-free).
                 if watcher is not None and watcher.failed:
+                    if self.is_kraken_plus:
+                        return False
                     if not self._retry_lcd_upload(mode, value, watcher):
                         return False
                 logger.info("LCD set_screen mode=%s value=%r ok", mode, value)
@@ -1187,9 +1218,8 @@ class KrakenDevice:
                     value,
                     exc,
                     (
-                        " -- another process is reading this device's HID node "
-                        "(a second OpenKraken instance, or another monitoring "
-                        "tool); the setting was not applied"
+                        " -- expected HID reply missing; possible protocol "
+                        "mismatch or competing reader; the setting was not applied"
                         if _DESYNC_MARKER in str(exc)
                         else ""
                     ),
@@ -1268,6 +1298,16 @@ class KrakenDevice:
         a dropped brightness/orientation is a one-shot setting that would
         otherwise be silently lost until the next apply.
         """
+        if self.is_kraken_plus:
+            # Plus uses framebuffer uploads, never bucket clears or nested retries.
+            if mode == "gif":
+                raise ValueError("Kraken Plus GIF playback is unsupported; use static or sensors mode")
+            with checked_replies(self._dev):
+                if mode == "static":
+                    upload_static(self._dev, value)
+                else:
+                    self._dev.set_screen("lcd", mode, value)
+            return
         for attempt in range(1, _LCD_HANDSHAKE_RETRIES + 1):
             try:
                 self._dev.set_screen("lcd", mode, value)

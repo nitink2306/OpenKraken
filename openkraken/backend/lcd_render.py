@@ -765,6 +765,7 @@ def render_to_file(
     style: str,
     data: LcdData,
     path: str = "/dev/shm/openkraken_lcd.png",
+    resolution: tuple[int, int] = (CANVAS, CANVAS),
 ) -> str:
     """Render *style*/*data* and write it as a PNG to *path*; return *path*.
 
@@ -772,6 +773,8 @@ def render_to_file(
     ~0.5 Hz without wearing the SSD.
     """
     img = render(style, data)
+    if img.size != resolution:
+        img = img.resize(resolution, Image.Resampling.LANCZOS)
     img.save(path, format="PNG")
     _LOGGER.debug("rendered LCD style %r to %s", style, path)
     return path

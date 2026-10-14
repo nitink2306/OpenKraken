@@ -1,0 +1,21 @@
+[
+  {
+    "test": "direct_liquidctl_with_reply_guard",
+    "seconds": 1.5,
+    "error": "Plus command 30 04 00: expected 31 04; Plus HID reply timed out"
+  },
+  {
+    "test": "patched_static_after_direct_failure",
+    "ok": true,
+    "seconds": 0.086
+  },
+  {
+    "test": "gif_rejected_cleanly",
+    "ok": true,
+    "connected": true
+  },
+  {
+    "test": "status_after_failure",
+    "value": "DeviceStatus(liquid_temp=29.5, pump_rpm=2549, pump_duty=75, fan_rpm=796, fan_duty=33, connected=True, timestamp=4652.656861281)"
+  }
+]

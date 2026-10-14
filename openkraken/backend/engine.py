@@ -819,7 +819,10 @@ class ControlEngine(QThread):
             ring_color=tuple(self._lcd_cfg.ring_color),
         )
         try:
-            path = lcd_render.render_to_file(self._lcd_cfg.sensor_style, data)
+            path = lcd_render.render_to_file(
+                self._lcd_cfg.sensor_style, data,
+                resolution=self._device.lcd_resolution,
+            )
         except Exception:  # pragma: no cover - rendering must not crash the loop
             _LOGGER.exception("failed to render LCD sensor frame")
             return

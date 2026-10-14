@@ -1,0 +1,57 @@
+[
+  {
+    "test": "status_before",
+    "seconds": 0.001,
+    "result": "DeviceStatus(liquid_temp=29.5, pump_rpm=2554, pump_duty=75, fan_rpm=701, fan_duty=26, connected=True, timestamp=4486.064807869)"
+  },
+  {
+    "test": "liquid",
+    "seconds": 0.017,
+    "result": "True"
+  },
+  {
+    "test": "brightness",
+    "seconds": 0.016,
+    "result": "True"
+  },
+  {
+    "test": "orientation",
+    "seconds": 0.03,
+    "result": "True"
+  },
+  {
+    "test": "static",
+    "seconds": 0.118,
+    "result": "True"
+  },
+  {
+    "test": "sensor_0",
+    "seconds": 0.103,
+    "result": "True"
+  },
+  {
+    "test": "status_0",
+    "seconds": 0.001,
+    "result": "DeviceStatus(liquid_temp=29.5, pump_rpm=2540, pump_duty=75, fan_rpm=700, fan_duty=26, connected=True, timestamp=4489.356951496)"
+  },
+  {
+    "test": "sensor_1",
+    "seconds": 0.103,
+    "result": "True"
+  },
+  {
+    "test": "status_1",
+    "seconds": 0.001,
+    "result": "DeviceStatus(liquid_temp=29.5, pump_rpm=2540, pump_duty=75, fan_rpm=699, fan_duty=26, connected=True, timestamp=4490.46592731)"
+  },
+  {
+    "test": "sensor_2",
+    "seconds": 0.104,
+    "result": "True"
+  },
+  {
+    "test": "status_2",
+    "seconds": 0.001,
+    "result": "DeviceStatus(liquid_temp=29.5, pump_rpm=2554, pump_duty=75, fan_rpm=700, fan_duty=26, connected=True, timestamp=4491.576106378)"
+  }
+]
