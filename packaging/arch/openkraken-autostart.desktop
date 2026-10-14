@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OpenKraken
+Comment=Start Kraken cooling control and live LCD in the system tray
+Exec=/usr/bin/openkraken --minimized
+TryExec=/usr/bin/openkraken
+Icon=openkraken
+Terminal=false
+StartupNotify=false

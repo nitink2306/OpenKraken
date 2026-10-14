@@ -97,15 +97,11 @@ defaults, and personal configuration files are not included in this repository.
 The original configuration is backed up at
 `~/.config/openkraken/config.before-plus-fix.json`.
 
-The running application was launched from this patched checkout. The distro's
-`/usr/bin/openkraken` installation has **not** been replaced. To run this version
-after closing the current app:
+The source-checkout run was used for hardware validation. Persistent deployment
+uses the fork's native Arch package (`0.4.1-2`) and an XDG login-autostart entry
+running `/usr/bin/openkraken --minimized`. The package copies the code into
+`/usr/lib/openkraken`, independent of the development checkout.
 
-```sh
-cd /path/to/OpenKraken
-python -m openkraken
-```
-
-A previously configured distro/autostart launcher still uses the old package.
 Local runtime logs and configuration backups are not part of this repository.
-See [maintaining this fork](maintaining-plus-fork.md) for the branch and update workflow.
+See [maintaining this fork](maintaining-plus-fork.md) for installation, autostart,
+and the reviewed upstream-update workflow.

@@ -12,10 +12,10 @@
 
 pkgname=openkraken
 pkgver=0.4.1
-pkgrel=1
+pkgrel=2
 pkgdesc="NZXT Kraken control for Linux — loop monitoring, firmware fan curves, and the round LCD"
 arch=('any')
-url="https://github.com/davidboulay/OpenKraken"
+url="https://github.com/nitink2306/OpenKraken"
 license=('MIT')
 depends=(
     'python'
@@ -139,5 +139,11 @@ DESKTOP
     # --- docs & licence ----------------------------------------------------
     install -Dm644 "$_repo_root/README.md"   "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 "$_repo_root/PROTOCOL.md" "$pkgdir/usr/share/doc/$pkgname/PROTOCOL.md"
+    install -Dm644 "$_repo_root/docs/kraken-plus-investigation.md" \
+        "$pkgdir/usr/share/doc/$pkgname/kraken-plus-investigation.md"
+    install -Dm644 "$_repo_root/docs/maintaining-plus-fork.md" \
+        "$pkgdir/usr/share/doc/$pkgname/maintaining-plus-fork.md"
+    install -Dm644 "$startdir/openkraken-autostart.desktop" \
+        "$pkgdir/usr/share/doc/$pkgname/openkraken-autostart.desktop"
     install -Dm644 "$_repo_root/LICENSE"     "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
