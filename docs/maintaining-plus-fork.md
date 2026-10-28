@@ -99,3 +99,25 @@ Normal distribution updates still manage Python, PyQt, Pillow, and liquidctl.
 This is a local pacman package; it does not automatically pull newer fork code.
 Keep a copy of the known-working `.pkg.tar.zst` for rollback. Installing a previous
 package with `pacman -U` restores its application files while keeping user config.
+
+## v0.5.1 integration (2026-10-28)
+
+The maintained branch merges upstream tag `v0.5.1` (`b2c087a`) and builds
+`openkraken-0.5.1-1-any.pkg.tar.zst`. The Plus RGB565 framebuffer adapter,
+reply filtering, 240x240 rendering and bounded retry behavior remain in place.
+The new Streaming selection always resolves to the supported static transport
+on Plus, including when Ring is selected. Other models retain upstream behavior.
+
+Validation: all 39 unit tests pass, including an added regression for all three
+Streaming choices on Plus. An exclusive test on USB 1e71:3014, firmware 1.0.0,
+with system liquidctl 1.16.0 sent 45 rendered liquid-temperature frames over
+90 seconds with no upload failures or warning/error logs. All 45 telemetry
+reads succeeded; pump duty remained 75%, pump speed was 2520–2549 RPM, and
+liquid temperature was 28.4–28.5°C. Frame uploads took 0.0805–0.0864 seconds.
+These are software acknowledgements; physical-screen confirmation is separate.
+Cold boot and cable-disconnect recovery were not tested in this update.
+
+The user's current saved cooling/display preferences were preserved, and the
+firmware liquid display was restored after the temporary rendered-screen test.
+A local configuration backup is `~/.config/openkraken/config.before-0.5.1.json`.
+Keep the previous `openkraken-0.4.1-2-any.pkg.tar.zst` for rollback.

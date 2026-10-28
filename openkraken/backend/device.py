@@ -28,6 +28,7 @@ import logging
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 from contextlib import nullcontext
@@ -110,6 +111,34 @@ _LCD_CLEAR_RETRIES = 2
 #: makes retrying worthwhile -- re-issuing without it just re-reads the same
 #: desynced queue and fails identically.
 _LCD_HANDSHAKE_RETRIES = 3
+
+#: USB product IDs on which the bucket-ring sensor streamer
+#: (:meth:`KrakenDevice.set_lcd_sensor_frame`) is known to be stable: it was
+#: developed and soak-tested on the Kraken 2024 Elite (1e71:3012).  Every other
+#: Z3-class model reported so far -- the Z53/Z63/Z73 (0x3008, issue #8) and a
+#: "Kraken 360" on the nzxt_kraken3 kernel driver (issue #9) -- either wedged
+#: its LCD bucket memory or desynced the HID stream on every ring frame, while
+#: the driver's full per-frame ``set_screen("static")`` upload ran for hours
+#: without a single error.  So the ``"auto"`` streaming mode only uses the ring
+#: on these products and sends everything else down the static path.  The LCD
+#: "Streaming" setting can force either path.
+_LCD_RING_STREAM_PRODUCTS = frozenset({0x3012})
+
+#: Held ring frames (HID read desync, or a bucket setup/switch the firmware
+#: refused -- not a refused delete, see :meth:`KrakenDevice._note_lcd_frame_stuck`) within the last :data:`_LCD_RING_TROUBLE_WINDOW` ring
+#: frames after which ``"auto"`` gives the ring up for the rest of the session
+#: and falls back to full static uploads.  Counted over a window, not as a
+#: streak: with a second reader on the HID stream (issue #11, the nzxt_kraken3
+#: kernel driver) desyncs and refused setups interleave with frames that do
+#: land -- some of them garbled -- so a consecutive count never got there.
+#: Issue #9's desync on every frame still trips it after 5 frames, below
+#: :data:`_LCD_DESYNC_RECONNECT_THRESHOLD` on purpose -- fall back before
+#: escalating to a reconnect.
+_LCD_RING_TROUBLE_FALLBACK = 5
+_LCD_RING_TROUBLE_WINDOW = 20
+
+#: Valid values of :attr:`KrakenDevice.lcd_stream_mode` / ``LcdConfig.sensor_stream``.
+LCD_STREAM_MODES = ("auto", "ring", "static")
 
 
 class _BucketFailureWatcher(logging.Handler):
@@ -311,7 +340,30 @@ class KrakenDevice:
         self._connected: bool = False
         self._description: str = ""
         self._lcd_retry_after = 0.0
+        #: USB product id of the connected cooler (e.g. 0x3012), ``None`` until
+        #: connected.  Selects the sensor-frame streaming path in ``"auto"`` mode.
+        self.product_id: int | None = None
+        #: Name of the kernel hwmon driver bound to the cooler (``"nzxt_kraken3"``),
+        #: ``None`` if none is.  Since Linux 7.3 it also binds the 2024 Elite
+        #: (issue #11); it shares the HID stream with us, which the ring cannot
+        #: survive, so ``"auto"`` streams via full static uploads while it is bound.
+        self.kernel_driver: str | None = None
         self.firmware_version: str = ""
+        #: Sensor-screen streaming path: ``"auto"`` (ring on products in
+        #: :data:`_LCD_RING_STREAM_PRODUCTS`, static elsewhere, static after the
+        #: ring misbehaves), ``"ring"`` (always the bucket ring) or ``"static"``
+        #: (always the driver's full per-frame upload).  Set by the engine from
+        #: ``LcdConfig.sensor_stream``.
+        self.lcd_stream_mode: str = "auto"
+        #: Latched for the rest of the process once ``"auto"`` has given up on
+        #: the ring for this cooler (wedged bucket memory or repeated held frames).
+        #: Deliberately NOT cleared by a reconnect: the reconnect is what clears
+        #: the wedge, and re-trying the ring after it is the loop in issue #8.
+        self._lcd_ring_fallback: bool = False
+        #: Latched once a duty write via the kernel hwmon driver's sysfs was
+        #: refused (EACCES: the pwm/curve attributes are root-only by default);
+        #: later writes go straight to the HID interface (issue #10).
+        self._hwmon_direct: bool = False
         self.lcd_brightness: int = 50
         self.lcd_orientation: int = 0
         #: Parsed lighting/accessory info; ``None`` until a successful
@@ -348,6 +400,9 @@ class KrakenDevice:
         #: :attr:`_lcd_consec_fail` so a crowded read stream never masquerades as
         #: wedged bucket memory (see :data:`_LCD_DESYNC_RECONNECT_THRESHOLD`).
         self._lcd_desync_consec: int = 0
+        #: Outcome of the most recent ring frames (``True`` = held), for the
+        #: ``"auto"`` fallback (:data:`_LCD_RING_TROUBLE_FALLBACK`).
+        self._lcd_ring_recent: deque[bool] = deque(maxlen=_LCD_RING_TROUBLE_WINDOW)
         #: Latched when the USB *bulk* interface (image/GIF/sensor-frame uploads)
         #: fails with EBUSY/EACCES.  The HID side keeps working, so we stay
         #: connected and simply stop attempting bulk uploads until a manual
@@ -485,6 +540,16 @@ class KrakenDevice:
             self._dev = chosen
             self._connected = True
             self._description = str(getattr(chosen, "description", "") or "")
+            try:
+                self.product_id = int(getattr(chosen, "product_id", None))
+            except (TypeError, ValueError):
+                self.product_id = None
+            hwmon = getattr(chosen, "_hwmon", None)
+            self.kernel_driver = (getattr(hwmon, "driver", None) or "nzxt_kraken3") if hwmon else None
+            self._lcd_ring_recent.clear()
+            # Fresh handles: let the hwmon path prove itself again (a udev rule
+            # may have been installed since).
+            self._hwmon_direct = False
             self._install_lcd_switch_guard(chosen)
             # Fresh device: no ring slot is displayed yet, and the panel is in its
             # firmware-stored display mode -- force a full re-init on the first
@@ -502,6 +567,13 @@ class KrakenDevice:
                 self.lcd_brightness,
                 self.lcd_orientation,
             )
+            if self.kernel_driver and self.lcd_stream_mode == "auto":
+                logger.info(
+                    "%s kernel driver is bound to the cooler; streaming sensor frames "
+                    "as full static uploads (blacklist the module to use the "
+                    "flicker-free ring, see README)",
+                    self.kernel_driver,
+                )
 
             # Best-effort lighting discovery (PROTOCOL.md §3 step 2 / §6).  A
             # failure here must NOT fail the connection: lighting is optional and
@@ -596,7 +668,12 @@ class KrakenDevice:
                 logger.warning("set_speed_profile(%s): device not connected", channel)
                 return False
             try:
-                self._dev.set_speed_profile(channel, list(points))
+                self._duty_write(
+                    f"set_speed_profile({channel})",
+                    self._dev.set_speed_profile,
+                    channel,
+                    list(points),
+                )
                 return True
             except Exception:
                 logger.exception(
@@ -604,6 +681,36 @@ class KrakenDevice:
                 )
                 self._mark_disconnected()
                 return False
+
+    def _duty_write(self, what: str, call: Any, *args: Any) -> None:
+        """Run a driver duty write, surviving a root-only hwmon sysfs.
+
+        With the ``nzxt_kraken3`` kernel driver bound, liquidctl writes duty
+        curves/fixed speeds to the driver's hwmon attributes
+        (``temp1_auto_point*_pwm``, ``pwm1`` ...) instead of the HID interface.
+        Those files are ``root:root 0200`` by default, so an ordinary user gets
+        ``PermissionError`` -- which used to be treated as a dead device and
+        kicked off a disconnect/reconnect/reapply loop (issue #10).  The cooler
+        is fine and the HID node is already ours (udev rule), so retry the write
+        with ``direct_access=True`` and keep using direct writes for the rest of
+        this connection.  The one-time warning points at the hwmon udev rule for
+        people who prefer the kernel-driver path.
+        """
+        try:
+            call(*args, direct_access=self._hwmon_direct)
+        except PermissionError as exc:
+            if self._hwmon_direct:
+                raise
+            logger.warning(
+                "%s: the kernel driver's hwmon attributes are not writable by this "
+                "user (%s); writing cooling settings directly over HID instead. To "
+                "use the kernel driver's hwmon path, install the hwmon udev rule "
+                "(README, Permissions).",
+                what,
+                exc,
+            )
+            self._hwmon_direct = True
+            call(*args, direct_access=True)
 
     def set_fixed_speed(self, channel: str, duty: int) -> bool:
         """Set ``channel`` to a flat ``duty`` (clamped to the channel limits)."""
@@ -613,7 +720,12 @@ class KrakenDevice:
                 logger.warning("set_fixed_speed(%s): device not connected", channel)
                 return False
             try:
-                self._dev.set_fixed_speed(channel, clamped)
+                self._duty_write(
+                    f"set_fixed_speed({channel})",
+                    self._dev.set_fixed_speed,
+                    channel,
+                    clamped,
+                )
                 logger.info("Set %s fixed speed to %d%%", channel, clamped)
                 return True
             except Exception:
@@ -758,6 +870,12 @@ class KrakenDevice:
                     self._lcd_stream_needs_reinit = False
                     self._lcd_consec_fail = 0
             return ok
+        if self.lcd_stream_path() == "static":
+            # The driver's full upload (delete-all + setup + bulk + switch) per
+            # frame.  Heavier on the bus than the ring, but it is the path the
+            # Z53/Z63/Z73 and the nzxt_kraken3-bound Kraken 360 run stably on
+            # (issues #8/#9: 2349 frames, zero errors, on a Z73 fw 5.11.0).
+            return self._set_screen("static", str(image_path))
         with self._lock:
             if self._dev is None or not self._connected:
                 logger.warning("set_lcd_sensor_frame: device not connected")
@@ -800,7 +918,6 @@ class KrakenDevice:
                 return self._set_screen("static", str(image_path))
             prev = self._lcd_ring_pos
             target = 0 if prev is None else (prev + 1) % _LCD_RING_BUCKETS
-            mem_offset = target * data_size
 
             try:
                 dev._write_then_read([0x36, 0x03])  # transfer preamble (per _send_data)
@@ -809,13 +926,28 @@ class KrakenDevice:
                 # A refused delete (firmware status 0x09) means this slot is not
                 # ours to reuse -- it is what the panel is showing, e.g. after a
                 # full set_screen("static") fallback landed there.  The setup that
-                # follows would be refused too (0x04), so stop here and record the
+                # follows would be refused too (0x04), so step to the next slot
+                # within this same frame.  Abandoning the frame after the preamble
+                # instead blanks the panel until the next frame lands (issue #11:
+                # a ~2 s black flash every 20-60 s on the 2024 Elite).  If the
+                # next slot is refused as well, hold the frame and record the
                 # slot as our position: the next frame then advances off it.
-                # Without this the ring pins to one bucket and every frame fails,
+                # Without that the ring pins to one bucket and every frame fails,
                 # which trips the reconnect threshold in a loop.
                 if not dev._delete_bucket(target):
-                    self._lcd_ring_pos = target
-                    return self._note_lcd_frame_stuck("delete bucket %d" % target)
+                    refused = target
+                    target = (target + 1) % _LCD_RING_BUCKETS
+                    if target == prev or not dev._delete_bucket(target):
+                        self._lcd_ring_pos = target if target != prev else refused
+                        return self._note_lcd_frame_stuck(
+                            "delete bucket %d" % refused, trouble=False
+                        )
+                    logger.debug(
+                        "sensor frame: bucket %d in use; writing bucket %d instead",
+                        refused,
+                        target,
+                    )
+                mem_offset = target * data_size
                 if not dev._setup_bucket(
                     target,
                     target + 1,
@@ -833,6 +965,7 @@ class KrakenDevice:
                 self._lcd_ring_pos = target
                 self._lcd_consec_fail = 0  # frame reached the panel; clear streaks
                 self._lcd_desync_consec = 0
+                self._note_ring_outcome(held=False)
                 return True
             except AssertionError as exc:
                 # liquidctl asserts "missing messages" when the reply it is
@@ -849,7 +982,9 @@ class KrakenDevice:
                     return False
                 self._flush_hid_reports("sensor frame")
                 self._lcd_desync_consec += 1
-                if self._lcd_desync_consec >= _LCD_DESYNC_RECONNECT_THRESHOLD:
+                if self._note_ring_outcome(held=True):
+                    self._lcd_desync_consec = 0
+                elif self._lcd_desync_consec >= _LCD_DESYNC_RECONNECT_THRESHOLD:
                     logger.warning(
                         "LCD HID stream desynced %d× in a row despite flushing; "
                         "reconnecting to resync",
@@ -885,7 +1020,7 @@ class KrakenDevice:
                 self._mark_disconnected()
                 return False
 
-    def _note_lcd_frame_stuck(self, what: str) -> bool:
+    def _note_lcd_frame_stuck(self, what: str, trouble: bool = True) -> bool:
         """Record a held LCD frame; reconnect once the bucket memory is wedged.
 
         A few consecutive bucket setup/switch failures (firmware rejecting them
@@ -897,7 +1032,14 @@ class KrakenDevice:
         and let the engine's reconnect loop re-open it and re-apply the LCD.  Caller
         holds the lock; ``_mark_disconnected`` is re-entrant-safe under the RLock.
         Always returns ``False`` (this frame did not reach the panel).
+
+        ``trouble=False`` keeps a refused *delete* out of the ``"auto"`` fallback
+        window: on a healthy cooler it routinely means "that slot is on screen"
+        and the ring just steps past it (~1 frame in 8 on the 2024 Elite).  A
+        delete that keeps failing still reaches the wedge reconnect above.
         """
+        if trouble:
+            self._note_ring_outcome(held=True)
         self._lcd_consec_fail += 1
         if self._lcd_consec_fail >= _LCD_FAIL_RECONNECT_THRESHOLD:
             logger.warning(
@@ -905,6 +1047,10 @@ class KrakenDevice:
                 what,
                 self._lcd_consec_fail,
             )
+            if self.lcd_stream_mode == "auto":
+                # Reconnecting un-wedges the memory, but re-trying the ring
+                # afterwards just wedged it again (issue #8's reconnect loop).
+                self._give_up_ring("bucket memory wedged")
             self._lcd_consec_fail = 0
             self._mark_disconnected()
         else:
@@ -915,6 +1061,55 @@ class KrakenDevice:
                 _LCD_FAIL_RECONNECT_THRESHOLD,
             )
         return False
+
+    def _note_ring_outcome(self, held: bool) -> bool:
+        """Record a ring frame's outcome; in ``"auto"``, give the ring up once
+        :data:`_LCD_RING_TROUBLE_FALLBACK` of the recent frames were held.
+
+        Returns ``True`` when this call made ``"auto"`` fall back.
+        """
+        self._lcd_ring_recent.append(held)
+        if self.lcd_stream_mode != "auto" or self._lcd_ring_fallback:
+            return False
+        held_count = sum(self._lcd_ring_recent)
+        if held_count < _LCD_RING_TROUBLE_FALLBACK:
+            return False
+        self._give_up_ring(
+            "%d of the last %d ring frames were held (HID desync or refused bucket)"
+            % (held_count, len(self._lcd_ring_recent))
+        )
+        return True
+
+    def lcd_stream_path(self) -> str:
+        """The sensor-frame path in use right now: ``"ring"`` or ``"static"``.
+
+        Resolves :attr:`lcd_stream_mode`: a forced mode wins; ``"auto"`` uses
+        the ring only on :data:`_LCD_RING_STREAM_PRODUCTS`, only while no kernel
+        hwmon driver shares the HID stream (:attr:`kernel_driver`) and only until
+        the ring has misbehaved on this cooler (:attr:`_lcd_ring_fallback`).
+        """
+        # Plus firmware has no bucket protocol, even when ring is requested.
+        if self.is_kraken_plus:
+            return "static"
+        mode = self.lcd_stream_mode
+        if mode == "ring":
+            return "ring"
+        if mode == "static" or self._lcd_ring_fallback or self.kernel_driver:
+            return "static"
+        return "ring" if self.product_id in _LCD_RING_STREAM_PRODUCTS else "static"
+
+    def _give_up_ring(self, why: str) -> None:
+        """Latch the ``"auto"`` fallback to full static uploads (logged once)."""
+        if self._lcd_ring_fallback:
+            return
+        self._lcd_ring_fallback = True
+        logger.warning(
+            "LCD sensor streaming: %s on this cooler (%s); using full static "
+            "uploads per frame from now on (set LCD streaming to 'ring' to force "
+            "the bucket ring, or restart to retry it)",
+            why,
+            self._description or "Kraken device",
+        )
 
     def clear_lcd_media(self) -> bool:
         """Erase all media stored in the cooler's onboard LCD memory.

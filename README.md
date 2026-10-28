@@ -250,8 +250,20 @@ Then reload and re-apply — no re-plug or reboot needed:
 
 ```sh
 sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb
+sudo udevadm trigger --subsystem-match=hidraw --subsystem-match=usb --subsystem-match=hwmon
 sudo usermod -aG plugdev "$USER"      # Debian only, and only for the fallback
+```
+
+**Kernel driver (`nzxt_kraken3`) bound?** Then liquidctl writes duty curves to
+the driver's hwmon sysfs attributes, which are root-only by default. OpenKraken
+notices the refused write, logs one warning and falls back to writing the curve
+directly over HID, so cooling works either way (issue #10). If you'd rather the
+kernel-driver path be used (it also makes the `liquidctl` CLI work without
+root), both packages ship this third, optional line — sysfs attributes have no
+device node for a uaccess ACL, hence the `chmod`:
+
+```udev
+SUBSYSTEM=="hwmon", ACTION=="add", ATTRS{idVendor}=="1e71", RUN+="/bin/sh -c 'chmod a+w /sys%p/pwm[12] /sys%p/pwm[12]_enable /sys%p/temp[12]_auto_point*_pwm 2>/dev/null || true'"
 ```
 
 `TAG+="uaccess"` is what actually grants access on any systemd-logind desktop:
@@ -366,6 +378,33 @@ Each rendered frame is a full-resolution bitmap uploaded over USB — roughly
 the **sensor screen defaults to a 2-second** refresh interval (configurable
 0.5–10 s on the LCD page). Animated GIFs are limited by the firmware to an
 encoded size of about **24 MB**.
+
+**What is the LCD "Streaming" setting?**
+How each sensor frame reaches the panel. **Bucket ring** double-buffers frames
+in the cooler's LCD memory, which is flicker-free and light on the USB link —
+but it only behaves on the **Kraken 2024 Elite** (`1e71:3012`), the model it
+was developed on. On the **Z53/Z63/Z73** and the 2023 models it wedges the LCD
+bucket memory or desyncs the HID stream every few frames (issues #8 and #9),
+while the driver's **full upload per frame** runs for hours without an error.
+**Auto** (the default) picks the ring on the 2024 Elite and the full upload
+everywhere else, and switches to the full upload for the rest of the session if
+the ring misbehaves anyway. Set it explicitly if you want to test the other
+path on your cooler.
+
+**Since Linux 7.3 the `nzxt_kraken3` kernel driver also binds the 2024 Elite**
+(issue #11). It reads the cooler's HID stream alongside OpenKraken, which
+garbles ring frames (the screen tiles, goes black, flashes back), so **Auto**
+uses the full upload while it is bound — the log says so at connect. That
+works, but the screen blinks on every frame. To get the flicker-free ring back,
+stop the module from loading; OpenKraken does not need it:
+
+```sh
+echo 'blacklist nzxt_kraken3' | sudo tee /etc/modprobe.d/openkraken-no-kraken3.conf
+sudo rmmod nzxt_kraken3   # or reboot
+```
+
+Check with `ls /sys/bus/hid/drivers/nzxt_kraken3/` (no `0003:1E71:…` entry =
+not bound), then restart OpenKraken.
 
 **Do my fan/pump curves survive closing the app — or a reboot?**
 **Liquid-temp curves** are written into the cooler's firmware as a 40-point

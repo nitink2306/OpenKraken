@@ -141,6 +141,20 @@ class PlusTest(unittest.TestCase):
                          [0x36, 0x01, 0, 1, 6], [0x36, 0x02],
                          [0x36, 0x01, 0, 1, 6], [0x36, 0x02]])
 
+    def test_sensor_stream_modes_preserve_plus_transport(self):
+        for mode in ("auto", "static", "ring"):
+            with self.subTest(mode=mode):
+                driver = Driver([report((0x31, 0x01)), report((0x75, 0x02)),
+                                 report((0x37, 0x01)), report((0x37, 0x02)),
+                                 report((0x37, 0x01)), report((0x37, 0x02))])
+                device = self.device(driver)
+                device.lcd_stream_mode = mode
+                self.assertEqual(device.lcd_stream_path(), "static")
+                self.assertTrue(device.set_lcd_sensor_frame('unused.png'))
+                self.assertEqual(driver.writes, [[0x30, 0x01],
+                                 [0x36, 0x01, 0, 1, 6], [0x36, 0x02],
+                                 [0x36, 0x01, 0, 1, 6], [0x36, 0x02]])
+
     def test_rejected_transfer_cannot_report_success(self):
         driver = Driver([report((0x31, 0x01)), report((0x37, 0x01), {14: 0})])
         device = self.device(driver)

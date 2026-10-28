@@ -108,15 +108,139 @@ class FakeKrakenDriver:
 
 
 class LcdBucketRingTest(unittest.TestCase):
-    def _connected_device(self, **kwargs) -> tuple[KrakenDevice, FakeKrakenDriver]:
+    def _connected_device(
+        self, product_id: int | None = 0x3012, stream: str = "auto", **kwargs
+    ) -> tuple[KrakenDevice, FakeKrakenDriver]:
         dev = KrakenDevice()
         driver = FakeKrakenDriver(**kwargs)
         dev._dev = driver
         dev._connected = True
+        # The ring streamer is only used on the Kraken 2024 Elite in "auto".
+        dev.product_id = product_id
+        dev.lcd_stream_mode = stream
         # Panel is already in image/bucket mode, so frames take the ring path
         # instead of the full set_screen("static") re-establish.
         dev._lcd_stream_needs_reinit = False
         return dev, driver
+
+    @staticmethod
+    def _reconnect(dev: KrakenDevice, driver: FakeKrakenDriver) -> None:
+        """Model the engine re-opening the cooler after a disconnect."""
+        dev._dev = driver
+        dev._connected = True
+        dev._lcd_stream_needs_reinit = False
+
+    # ------------------------------------------------------- streaming path
+    def test_auto_uses_the_ring_only_on_the_2024_elite(self):
+        """Issue #8: the ring wedges a Z73's bucket memory; static is stable."""
+        for product, path in ((0x3012, "ring"), (0x3008, "static"), (0x300E, "static"), (None, "static")):
+            dev, driver = self._connected_device(product_id=product)
+            self.assertEqual(path, dev.lcd_stream_path(), hex(product or 0))
+            self.assertTrue(dev.set_lcd_sensor_frame("frame.png"))
+            if path == "ring":
+                self.assertEqual([0], driver.switched)
+                self.assertEqual(0, driver.screen_calls)
+            else:
+                self.assertEqual([], driver.deleted, "static path must not touch the ring")
+                self.assertEqual(1, driver.screen_calls, "frame goes through set_screen")
+
+    def test_a_forced_mode_overrides_the_product_choice(self):
+        dev, driver = self._connected_device(product_id=0x3008, stream="ring")
+        self.assertTrue(dev.set_lcd_sensor_frame("frame.png"))
+        self.assertEqual([0], driver.switched)
+
+        dev, driver = self._connected_device(product_id=0x3012, stream="static")
+        self.assertTrue(dev.set_lcd_sensor_frame("frame.png"))
+        self.assertEqual(1, driver.screen_calls)
+        self.assertEqual([], driver.deleted)
+
+    def test_auto_falls_back_to_static_after_a_bucket_wedge(self):
+        """Issue #8's loop: reconnect un-wedges the memory, then the ring wedges it again.
+
+        After the wedge-triggered reconnect, "auto" must stop using the ring on
+        this cooler and send frames through the full static upload instead.
+        """
+        dev, driver = self._connected_device(undeletable=set(range(6)))
+
+        for _ in range(4):
+            dev.set_lcd_sensor_frame("frame.png")
+        self.assertFalse(dev.is_connected, "wedged bucket memory still reconnects")
+
+        self._reconnect(dev, driver)
+        self.assertEqual("static", dev.lcd_stream_path())
+        self.assertTrue(dev.set_lcd_sensor_frame("frame.png"))
+        self.assertEqual(1, driver.screen_calls)
+        self.assertEqual(8, len(driver.deleted), "no further ring attempts (2 slots per frame)")
+
+    def test_auto_falls_back_to_static_after_a_desync_streak(self):
+        """Issue #9: a desync on every ring frame, while static uploads are fine."""
+        dev, driver = self._connected_device(delete_desyncs=5)
+
+        results = [dev.set_lcd_sensor_frame("frame.png") for _ in range(5)]
+
+        self.assertEqual([False] * 5, results)
+        self.assertTrue(dev.is_connected, "a desync streak is not a dead cooler")
+        self.assertEqual("static", dev.lcd_stream_path())
+        self.assertTrue(dev.set_lcd_sensor_frame("frame.png"))
+        self.assertEqual(1, driver.screen_calls)
+
+    def test_auto_skips_the_ring_while_the_kernel_driver_is_bound(self):
+        """Issue #11: Linux 7.3's nzxt_kraken3 binds the 2024 Elite and garbles the ring."""
+        dev, driver = self._connected_device(product_id=0x3012)
+        dev.kernel_driver = "nzxt_kraken3"
+
+        self.assertEqual("static", dev.lcd_stream_path())
+        self.assertTrue(dev.set_lcd_sensor_frame("frame.png"))
+        self.assertEqual(1, driver.screen_calls)
+        self.assertEqual([], driver.deleted, "static path must not touch the ring")
+
+        dev.lcd_stream_mode = "ring"
+        self.assertEqual("ring", dev.lcd_stream_path(), "a forced ring still wins")
+
+    def test_auto_falls_back_when_held_frames_interleave_with_good_ones(self):
+        """Issue #11's log: desync, landed frame, refused setup, landed frame...
+
+        No streak ever reaches the fallback, so it must count over a window.
+        """
+        dev, driver = self._connected_device()
+
+        for i in range(10):
+            if i % 2 == 0:
+                driver.pending_desyncs = 1
+            dev.set_lcd_sensor_frame("frame.png")
+
+        self.assertTrue(dev.is_connected)
+        self.assertEqual("static", dev.lcd_stream_path())
+
+    def test_an_occasional_held_frame_keeps_the_ring(self):
+        dev, driver = self._connected_device()
+
+        for i in range(40):
+            if i % 10 == 0:
+                driver.pending_desyncs = 1
+            dev.set_lcd_sensor_frame("frame.png")
+
+        self.assertEqual("ring", dev.lcd_stream_path())
+
+    def test_refused_deletes_alone_keep_the_ring(self):
+        """A refused delete is the ring stepping past the displayed slot, not trouble."""
+        dev, driver = self._connected_device(undeletable={1})
+
+        for _ in range(30):
+            dev.set_lcd_sensor_frame("frame.png")
+
+        self.assertTrue(dev.is_connected)
+        self.assertEqual("ring", dev.lcd_stream_path())
+
+    def test_a_forced_ring_never_falls_back(self):
+        dev, driver = self._connected_device(stream="ring", delete_desyncs=6)
+
+        for _ in range(6):
+            dev.set_lcd_sensor_frame("frame.png")
+
+        self.assertEqual("ring", dev.lcd_stream_path())
+        self.assertTrue(dev.set_lcd_sensor_frame("frame.png"))
+        self.assertEqual(0, driver.screen_calls)
 
     # ------------------------------------------------------- bucket ring
     def test_ring_advances_past_a_bucket_the_firmware_will_not_delete(self):
@@ -124,18 +248,26 @@ class LcdBucketRingTest(unittest.TestCase):
 
         Bucket 0 holds the image the panel is showing (the previous full
         set_screen("static") put it there), so the firmware answers 0x09 to a
-        delete and 0x04 to the setup that follows.  The first frame is held, but
-        the second must move to bucket 1 and land.
+        delete and 0x04 to the setup that follows.  The frame steps to bucket 1
+        in the same call and lands there (issue #11: abandoning it blanked the
+        panel until the next frame).
         """
         dev, driver = self._connected_device(undeletable={0})
 
         first = dev.set_lcd_sensor_frame("frame.png")
         second = dev.set_lcd_sensor_frame("frame.png")
 
-        self.assertFalse(first, "frame on the displayed bucket cannot land")
-        self.assertTrue(second, "next frame must use a different bucket and land")
-        self.assertEqual([0, 1], driver.deleted, "ring must advance off bucket 0")
-        self.assertEqual([1], driver.switched, "only the good frame reaches the panel")
+        self.assertTrue(first, "frame steps past the displayed bucket and lands")
+        self.assertTrue(second)
+        self.assertEqual([0, 1, 2], driver.deleted, "ring must advance off bucket 0")
+        self.assertEqual([1, 2], driver.switched)
+
+    def test_a_frame_is_held_when_the_next_bucket_is_refused_too(self):
+        dev, driver = self._connected_device(undeletable={0, 1})
+
+        self.assertFalse(dev.set_lcd_sensor_frame("frame.png"))
+        self.assertTrue(dev.set_lcd_sensor_frame("frame.png"))
+        self.assertEqual([2], driver.switched, "next frame advances past both")
 
     def test_setup_is_not_attempted_on_a_bucket_that_failed_to_delete(self):
         """Skip the doomed setup instead of provoking the firmware's 0x04."""
